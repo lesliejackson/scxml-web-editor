@@ -4,12 +4,21 @@ import type { editor } from 'monaco-editor';
 import Diagram from './components/Diagram';
 import Inspector from './components/Inspector';
 import Problems from './components/Problems';
-import { updateAttribute } from './scxml/editor';
+import {
+  insertCompoundState,
+  insertState,
+  insertTransition,
+  updateAttribute,
+  type StateElementType,
+} from './scxml/editor';
 import { defaultScxml } from './scxml/sample';
 import { analyzeScxml } from './scxml/validator';
-import { attr, childStates, displayName, scxmlChildren, type Diagnostic, type ScxmlNode } from './scxml/types';
+import { SCXML_NS, attr, childStates, displayName, scxmlChildren, type Diagnostic, type ScxmlNode } from './scxml/types';
 
 type BottomTab = 'source' | 'problems';
+type StateCreationType = StateElementType | 'compound';
+
+const XML_ID_PATTERN = /^[A-Za-z_][A-Za-z0-9._-]*$/;
 
 function findNode(root: ScxmlNode | undefined, uid: string | undefined): ScxmlNode | undefined {
   if (!root || !uid) return undefined;
@@ -22,6 +31,55 @@ function findNode(root: ScxmlNode | undefined, uid: string | undefined): ScxmlNo
 
 function nodeKey(node: ScxmlNode) {
   return attr(node, 'id') || node.uid;
+}
+
+function canContainStates(node: ScxmlNode | undefined): node is ScxmlNode {
+  return Boolean(node && node.uri === SCXML_NS && ['scxml', 'state', 'parallel'].includes(node.local));
+}
+
+function collectIds(root: ScxmlNode | undefined): Set<string> {
+  const ids = new Set<string>();
+  const visit = (node?: ScxmlNode) => {
+    if (!node) return;
+    const id = attr(node, 'id');
+    if (id) ids.add(id);
+    node.children.forEach(visit);
+  };
+  visit(root);
+  return ids;
+}
+
+function nextAvailableId(root: ScxmlNode | undefined, type: StateCreationType): string {
+  const ids = collectIds(root);
+  const prefix = type === 'state' ? 'state' : type;
+  let index = 1;
+  while (ids.has(`${prefix}${index}`)) index += 1;
+  return `${prefix}${index}`;
+}
+
+function nextAvailableNamedId(root: ScxmlNode | undefined, base: string): string {
+  const ids = collectIds(root);
+  if (!ids.has(base)) return base;
+  let index = 2;
+  while (ids.has(`${base}${index}`)) index += 1;
+  return `${base}${index}`;
+}
+
+function targetStates(root: ScxmlNode | undefined): ScxmlNode[] {
+  const result: ScxmlNode[] = [];
+  const visit = (node?: ScxmlNode) => {
+    if (!node) return;
+    if (node.uri === SCXML_NS && (['state', 'parallel', 'final'].includes(node.local)) && attr(node, 'id')) result.push(node);
+    node.children.forEach(visit);
+  };
+  visit(root);
+  return result;
+}
+
+type TransitionOwner = ScxmlNode & { local: 'state' | 'parallel' };
+
+function canOwnTransitions(node: ScxmlNode | undefined): node is TransitionOwner {
+  return Boolean(node && node.uri === SCXML_NS && ['state', 'parallel'].includes(node.local));
 }
 
 function findStateByKey(root: ScxmlNode | undefined, key: string | undefined): ScxmlNode | undefined {
@@ -44,7 +102,7 @@ function OutlineNode({ node, selectedUid, onSelect }: { node: ScxmlNode; selecte
   return (
     <li>
       <button type="button" className={selectedUid === node.uid ? 'active' : ''} onClick={() => onSelect(node)}>
-        <span className={`tree-icon ${node.local}`}>{node.local === 'final' ? '●' : node.local === 'parallel' ? 'Ⅱ' : node.local === 'history' ? 'H' : '◇'}</span>
+        <span className={`tree-icon ${node.local}`} aria-hidden="true">{node.local === 'final' ? '●' : node.local === 'parallel' ? 'Ⅱ' : node.local === 'history' ? 'H' : '◇'}</span>
         <span>{displayName(node)}</span>
       </button>
       {!!children.length && <ul>{children.map((child) => <OutlineNode key={child.uid} node={child} selectedUid={selectedUid} onSelect={onSelect} />)}</ul>}
@@ -61,6 +119,20 @@ export default function App() {
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
   const [bottomOpen, setBottomOpen] = useState(true);
+  const [addStateOpen, setAddStateOpen] = useState(false);
+  const [newStateId, setNewStateId] = useState('state1');
+  const [newStateType, setNewStateType] = useState<StateCreationType>('state');
+  const [newInitialStateId, setNewInitialStateId] = useState('state1Initial');
+  const [addStateError, setAddStateError] = useState('');
+  const [addTransitionOpen, setAddTransitionOpen] = useState(false);
+  const [transitionSourceKey, setTransitionSourceKey] = useState<string>();
+  const [newTransitionTarget, setNewTransitionTarget] = useState('');
+  const [newTransitionEvent, setNewTransitionEvent] = useState('');
+  const [newTransitionCond, setNewTransitionCond] = useState('');
+  const [newTransitionType, setNewTransitionType] = useState<'' | 'internal' | 'external'>('');
+  const [addTransitionError, setAddTransitionError] = useState('');
+  const [pendingSelectionId, setPendingSelectionId] = useState<string>();
+  const [pendingTransition, setPendingTransition] = useState<{ ownerKey: string; index: number }>();
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
     const fromUrl = new URLSearchParams(window.location.search).get('theme');
     if (fromUrl === 'light' || fromUrl === 'dark') return fromUrl;
@@ -79,6 +151,13 @@ export default function App() {
   const visualRoot = syntaxBroken ? lastValidRoot.current : analysis.root;
   const scope = findStateByKey(visualRoot, scopeKey);
   const selected = findNode(visualRoot, selectedUid);
+  const addParent = scope ? (canContainStates(scope) ? scope : undefined) : (canContainStates(visualRoot) ? visualRoot : undefined);
+  const transitionParent = canOwnTransitions(selected)
+    ? selected
+    : selected?.local === 'transition' && canOwnTransitions(selected.parent)
+      ? selected.parent
+      : !selected && canOwnTransitions(scope) ? scope : undefined;
+  const availableTargets = useMemo(() => targetStates(visualRoot), [visualRoot]);
   const errors = analysis.diagnostics.filter((item) => item.severity === 'error');
   const invalidUids = useMemo(() => new Set(analysis.diagnostics.map((item) => item.nodeUid).filter((uid): uid is string => Boolean(uid))), [analysis.diagnostics]);
 
@@ -104,6 +183,34 @@ export default function App() {
     localStorage.setItem('scxml-theme', theme);
     monacoRef.current?.editor.setTheme(theme === 'light' ? 'scxml-day' : 'scxml-night');
   }, [theme]);
+
+  useEffect(() => {
+    if (pendingSelectionId) {
+      const match = findStateByKey(analysis.root, pendingSelectionId);
+      if (match) setSelectedUid(match.uid);
+      setPendingSelectionId(undefined);
+    }
+  }, [analysis.root, pendingSelectionId]);
+
+  useEffect(() => {
+    if (!pendingTransition) return;
+    const owner = findStateByKey(analysis.root, pendingTransition.ownerKey);
+    const transition = owner ? scxmlChildren(owner, 'transition')[pendingTransition.index] : undefined;
+    if (transition) setSelectedUid(transition.uid);
+    setPendingTransition(undefined);
+  }, [analysis.root, pendingTransition]);
+
+  useEffect(() => {
+    if (!addStateOpen && !addTransitionOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setAddStateOpen(false);
+        setAddTransitionOpen(false);
+      }
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [addStateOpen, addTransitionOpen]);
 
   useEffect(() => {
     const monaco = monacoRef.current;
@@ -181,6 +288,116 @@ export default function App() {
     });
   };
 
+  const openAddState = () => {
+    if (!addParent || syntaxBroken) return;
+    setNewStateType('state');
+    const id = nextAvailableId(visualRoot, 'state');
+    setNewStateId(id);
+    setNewInitialStateId(nextAvailableNamedId(visualRoot, `${id}Initial`));
+    setAddStateError('');
+    setAddStateOpen(true);
+  };
+
+  const openAddTransition = () => {
+    if (!transitionParent || syntaxBroken) return;
+    const sourceId = attr(transitionParent, 'id');
+    const defaultTarget = availableTargets.find((node) => attr(node, 'id') !== sourceId) || availableTargets[0];
+    setTransitionSourceKey(nodeKey(transitionParent));
+    setNewTransitionTarget(defaultTarget ? attr(defaultTarget, 'id') || '' : '');
+    setNewTransitionEvent('');
+    setNewTransitionCond('');
+    setNewTransitionType('');
+    setAddTransitionError('');
+    setAddTransitionOpen(true);
+  };
+
+  const addState = (event: React.FormEvent) => {
+    event.preventDefault();
+    if (syntaxBroken || !analysis.root) {
+      setAddStateError('XML 语法已发生变化，请先修复源码后重试');
+      return;
+    }
+    const currentParent = scopeKey ? findStateByKey(analysis.root, scopeKey) : analysis.root;
+    if (!canContainStates(currentParent)) {
+      setAddStateError('当前层级不支持添加子状态');
+      return;
+    }
+    const id = newStateId.trim();
+    if (!XML_ID_PATTERN.test(id)) {
+      setAddStateError('ID 必须以字母或下划线开头，且只能包含字母、数字、点、下划线和连字符');
+      return;
+    }
+    if (collectIds(analysis.root).has(id)) {
+      setAddStateError(`ID “${id}”已存在`);
+      return;
+    }
+    if (currentParent.local === 'parallel' && newStateType === 'final') {
+      setAddStateError('终态不能直接添加到并行状态下');
+      return;
+    }
+
+    const initialId = newInitialStateId.trim();
+    if (newStateType === 'compound') {
+      if (!XML_ID_PATTERN.test(initialId)) {
+        setAddStateError('初始子状态 ID 必须是合法的 XML ID');
+        return;
+      }
+      if (initialId === id || collectIds(analysis.root).has(initialId)) {
+        setAddStateError(`初始子状态 ID “${initialId}”已存在或与复合状态 ID 相同`);
+        return;
+      }
+    }
+
+    const next = newStateType === 'compound'
+      ? insertCompoundState(source, currentParent, id, initialId)
+      : insertState(source, currentParent, newStateType, id);
+    if (next === source) {
+      setAddStateError('无法定位插入位置，请检查 SCXML 源码');
+      return;
+    }
+    setSource(next);
+    setDirty(true);
+    setAddStateOpen(false);
+    setRightOpen(true);
+    setPendingSelectionId(id);
+  };
+
+  const addTransition = (event: React.FormEvent) => {
+    event.preventDefault();
+    if (syntaxBroken || !analysis.root) {
+      setAddTransitionError('XML 语法已发生变化，请先修复源码后重试');
+      return;
+    }
+    const owner = findStateByKey(analysis.root, transitionSourceKey);
+    if (!canOwnTransitions(owner)) {
+      setAddTransitionError('无法定位转换的源状态，请重新选择状态');
+      return;
+    }
+    const target = newTransitionTarget.trim();
+    if (!target || !targetStates(analysis.root).some((node) => attr(node, 'id') === target)) {
+      setAddTransitionError('请选择一个存在的目标状态');
+      return;
+    }
+    const transitionIndex = scxmlChildren(owner, 'transition').length;
+    const ownerKey = nodeKey(owner);
+    const next = insertTransition(source, owner, {
+      target,
+      event: newTransitionEvent,
+      cond: newTransitionCond,
+      type: newTransitionType,
+    });
+    if (next === source) {
+      setAddTransitionError('无法定位插入位置，请检查 SCXML 源码');
+      return;
+    }
+    setSource(next);
+    setDirty(true);
+    setAddTransitionOpen(false);
+    setRightOpen(true);
+    setShowAllTransitions(true);
+    setPendingTransition({ ownerKey, index: transitionIndex });
+  };
+
   const saveFile = () => {
     const blob = new Blob([source], { type: 'application/scxml+xml;charset=utf-8' });
     const url = URL.createObjectURL(blob);
@@ -238,7 +455,7 @@ export default function App() {
         {!leftOpen && <button type="button" className="reopen reopen-left" onClick={() => setLeftOpen(true)}>›</button>}
 
         <section className="canvas-panel">
-          <div className="canvas-title"><div className="diagram-breadcrumb"><button type="button" className={!scope ? 'current' : ''} onClick={() => { setScopeKey(undefined); setSelectedUid(undefined); }}>根</button>{breadcrumbs.map((node, index) => <span key={node.uid}><i>›</i><button type="button" className={index === breadcrumbs.length - 1 ? 'current' : ''} onClick={() => { setScopeKey(nodeKey(node)); setSelectedUid(undefined); }}>{displayName(node)}</button></span>)}</div><div className="canvas-actions"><button type="button" className={showAllTransitions ? 'active' : ''} onClick={() => setShowAllTransitions((value) => !value)}>{showAllTransitions ? '聚焦连线' : '显示当前层全部连线'}</button><div className="canvas-hint">双击复合状态进入</div></div></div>
+          <div className="canvas-title"><div className="diagram-breadcrumb"><button type="button" className={!scope ? 'current' : ''} onClick={() => { setScopeKey(undefined); setSelectedUid(undefined); }}>根</button>{breadcrumbs.map((node, index) => <span key={node.uid}><i>›</i><button type="button" className={index === breadcrumbs.length - 1 ? 'current' : ''} onClick={() => { setScopeKey(nodeKey(node)); setSelectedUid(undefined); }}>{displayName(node)}</button></span>)}</div><div className="canvas-actions"><button type="button" className="add-state-button" onClick={openAddState} disabled={!addParent || syntaxBroken} title={syntaxBroken ? '请先修复 XML 语法错误' : '在当前层级新增状态'}>＋ 新增状态</button><button type="button" className="add-transition-button" onClick={openAddTransition} disabled={!transitionParent || syntaxBroken} title={syntaxBroken ? '请先修复 XML 语法错误' : transitionParent ? `从 ${displayName(transitionParent)} 新增转换` : '请先选择普通状态或并行状态'}>＋ 新增 Transition</button><button type="button" className={showAllTransitions ? 'active' : ''} onClick={() => setShowAllTransitions((value) => !value)}>{showAllTransitions ? '聚焦连线' : '显示当前层全部连线'}</button><div className="canvas-hint">双击复合状态进入</div></div></div>
           {syntaxBroken && <div className="stale-banner">XML 尚未完整：画布暂时显示上一次有效结果</div>}
           <Diagram root={visualRoot} scope={scope} selectedUid={selectedUid} invalidUids={invalidUids} onSelect={selectNode} onEnter={enterNode} showAllTransitions={showAllTransitions} />
         </section>
@@ -264,6 +481,97 @@ export default function App() {
           ) : <Problems diagnostics={analysis.diagnostics} onSelect={locate} />}
         </div>}
       </section>
+
+      {addStateOpen && addParent && (
+        <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setAddStateOpen(false); }}>
+          <form className="add-state-dialog" role="dialog" aria-modal="true" aria-labelledby="add-state-title" onSubmit={addState}>
+            <div className="dialog-heading">
+              <div><small>当前层级</small><h2 id="add-state-title">新增状态</h2></div>
+              <button type="button" aria-label="关闭新增状态对话框" onClick={() => setAddStateOpen(false)}>×</button>
+            </div>
+            <p className="add-state-parent">将添加到 <strong>{addParent.local === 'scxml' ? '根 <scxml>' : displayName(addParent)}</strong></p>
+            <label>
+              <span>状态类型</span>
+              <select aria-label="状态类型" value={newStateType} onChange={(event) => {
+                const type = event.target.value as StateCreationType;
+                const previousDefaultInitial = `${newStateId}Initial`;
+                const nextId = /^(state|parallel|final|compound)\d+$/.test(newStateId) ? nextAvailableId(visualRoot, type) : newStateId;
+                setNewStateType(type);
+                if (nextId !== newStateId) setNewStateId(nextId);
+                if (type === 'compound' || newInitialStateId === previousDefaultInitial) {
+                  setNewInitialStateId(nextAvailableNamedId(visualRoot, `${nextId}Initial`));
+                }
+                setAddStateError('');
+              }}>
+                <option value="state">普通状态</option>
+                <option value="compound">复合状态</option>
+                <option value="parallel">并行状态</option>
+                {addParent.local !== 'parallel' && <option value="final">终态</option>}
+              </select>
+            </label>
+            <label>
+              <span>状态 ID</span>
+              <input aria-label="状态 ID" autoFocus value={newStateId} onChange={(event) => {
+                const value = event.target.value;
+                if (newStateType === 'compound' && newInitialStateId === `${newStateId}Initial`) setNewInitialStateId(`${value}Initial`);
+                setNewStateId(value);
+                setAddStateError('');
+              }} spellCheck={false} />
+            </label>
+            {newStateType === 'compound' && <label>
+              <span>初始子状态 ID</span>
+              <input aria-label="初始子状态 ID" value={newInitialStateId} onChange={(event) => { setNewInitialStateId(event.target.value); setAddStateError(''); }} spellCheck={false} />
+            </label>}
+            {addStateError && <div className="dialog-error" role="alert">{addStateError}</div>}
+            {newStateType === 'compound' && <div className="dialog-note neutral">将创建一个带初始子状态的 &lt;state&gt;，可在画布中双击进入。</div>}
+            {newStateType === 'parallel' && <div className="dialog-note">并行状态创建后需要至少添加一个子状态，完成前标准检查会提示错误。</div>}
+            <div className="dialog-actions">
+              <button type="button" onClick={() => setAddStateOpen(false)}>取消</button>
+              <button type="submit" className="primary">添加状态</button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {addTransitionOpen && transitionSourceKey && (
+        <div className="dialog-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setAddTransitionOpen(false); }}>
+          <form className="add-state-dialog" role="dialog" aria-modal="true" aria-labelledby="add-transition-title" onSubmit={addTransition}>
+            <div className="dialog-heading">
+              <div><small>状态转换</small><h2 id="add-transition-title">新增 Transition</h2></div>
+              <button type="button" aria-label="关闭新增 Transition 对话框" onClick={() => setAddTransitionOpen(false)}>×</button>
+            </div>
+            <p className="add-state-parent">源状态 <strong>{transitionParent ? displayName(transitionParent) : transitionSourceKey}</strong></p>
+            <label>
+              <span>目标状态</span>
+              <select aria-label="目标状态" autoFocus required value={newTransitionTarget} onChange={(event) => { setNewTransitionTarget(event.target.value); setAddTransitionError(''); }}>
+                <option value="" disabled>请选择目标状态</option>
+                {availableTargets.map((node) => <option key={node.uid} value={attr(node, 'id')}>{attr(node, 'id')}</option>)}
+              </select>
+            </label>
+            <label>
+              <span>事件（可选；留空表示无事件转换）</span>
+              <input aria-label="转换事件" value={newTransitionEvent} onChange={(event) => { setNewTransitionEvent(event.target.value); setAddTransitionError(''); }} spellCheck={false} placeholder="例如 order.submit" />
+            </label>
+            <label>
+              <span>条件 cond（可选）</span>
+              <input aria-label="转换条件" value={newTransitionCond} onChange={(event) => { setNewTransitionCond(event.target.value); setAddTransitionError(''); }} spellCheck={false} placeholder="例如 isApproved" />
+            </label>
+            <label>
+              <span>转换类型（可选）</span>
+              <select aria-label="转换类型" value={newTransitionType} onChange={(event) => { setNewTransitionType(event.target.value as '' | 'internal' | 'external'); setAddTransitionError(''); }}>
+                <option value="">默认</option>
+                <option value="external">external</option>
+                <option value="internal">internal</option>
+              </select>
+            </label>
+            {addTransitionError && <div className="dialog-error" role="alert">{addTransitionError}</div>}
+            <div className="dialog-actions">
+              <button type="button" onClick={() => setAddTransitionOpen(false)}>取消</button>
+              <button type="submit" className="primary">添加 Transition</button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }
